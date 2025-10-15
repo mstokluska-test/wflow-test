@@ -35,6 +35,7 @@ jobs:
           ref: ${{ env.DOWNSTREAM_BRANCH }}
           fetch-depth: 0
           persist-credentials: true
+          token: ${{ secrets.REPO_WORKFLOW_PAT }}
 
       - name: Set up Git
         run: |

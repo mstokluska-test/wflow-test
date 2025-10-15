@@ -157,22 +157,28 @@ jobs:
             fi
           fi
 
-      - name: Detect actual changes vs downstream (tree diff)
+      - name: Detect actual changes vs downstream (tree diff, excluding owned paths)
         id: diffcheck
+        shell: bash
         run: |
           set -euo pipefail
-          # Use merge-base compare (same view as a PR). If nothing changed, skip push/PR.
-          if git diff --quiet "origin/${DOWNSTREAM_BRANCH}...${HEAD_BRANCH}"; then
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-            echo "No actual diff vs downstream; skipping push/PR."
+          # Compare as PR would (merge-base), but ignore owned paths to avoid PRs for those only.
+          if git diff --quiet "origin/${DOWNSTREAM_BRANCH}...${HEAD_BRANCH}" -- . \
+            ':(exclude).github' \
+            ':(exclude)CHANGELOG' \
+            ':(exclude)OWNERS'
+          then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "Only owned-path changes (or no changes); skipping push/PR."
           else
-            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Push sync branch (only if changed)
         if: steps.diffcheck.outputs.has_changes == 'true'
         run: |
           set -euo pipefail
+          # Push only the HEAD_BRANCH (feature branch). No force-push to base branch.
           git push origin "${HEAD_BRANCH}" --force-with-lease
 
       - name: Create or update PR (only if changed)
@@ -182,7 +188,7 @@ jobs:
         run: |
           set -euo pipefail
           TITLE="fix: Sync upstream/${UPSTREAM_BRANCH} into ${DOWNSTREAM_BRANCH}"
-          BODY=$'Automated upstream sync rebased onto upstream; downstream-owned files preserved.\n\n- Source: upstream/'"${UPSTREAM_BRANCH}"$'\n- Base: '"${DOWNSTREAM_BRANCH}"
+          BODY=$'Automated upstream sync rebased onto upstream; downstream-owned files preserved.\n\n- Source: upstream/'"${UPSTREAM_BRANCH}"$'\n- Base: '"${DOWNSTREAM_BRANCH}"$'\n\nNote: Owned paths (.github, CHANGELOG, OWNERS) are ignored when deciding to open this PR.'
           PR_NUMBER=$(gh pr list \
             --repo "${GITHUB_REPOSITORY}" \
             --head "${HEAD_BRANCH}" \

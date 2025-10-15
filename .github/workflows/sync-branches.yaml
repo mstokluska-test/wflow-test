@@ -55,40 +55,32 @@ jobs:
           set -euo pipefail
           git checkout -B "${HEAD_BRANCH}" "origin/${DOWNSTREAM_BRANCH}"
 
-      - name: Rebase onto upstream and preserve owned paths (amend to avoid extra commits)
+      - name: Rebase onto upstream (keep downstream for owned paths)
         shell: bash
         run: |
           set -euo pipefail
           shopt -s globstar nullglob
+
+          # --- Owned paths: always keep downstream version ---
+          # Use a built-in "ours" merge driver via .git/info/attributes (not committed).
+          {
+            echo ".github/** merge=ours"
+            echo "CHANGELOG merge=ours"
+            echo "OWNERS merge=ours"
+          } >> .git/info/attributes
+          git config merge.ours.driver true
 
           OWNED_PATHS=(
             ".github/**"
             "CHANGELOG"
             "OWNERS"
           )
-
           is_owned() {
             local f="$1"
             for pat in "${OWNED_PATHS[@]}"; do
               [[ "$f" == $pat ]] && return 0
             done
             return 1
-          }
-
-          repin_owned_paths() {
-            # Force owned paths to exactly match downstream
-            for p in ".github" "CHANGELOG" "OWNERS"; do
-              if git cat-file -e "origin/${DOWNSTREAM_BRANCH}:${p}" 2>/dev/null; then
-                git checkout "origin/${DOWNSTREAM_BRANCH}" -- "${p%/}" || true
-              elif git ls-tree -r --name-only "origin/${DOWNSTREAM_BRANCH}" | grep -q "^${p%/}/"; then
-                git checkout "origin/${DOWNSTREAM_BRANCH}" -- "${p%/}" || true
-              else
-                # Path absent in downstream -> remove from HEAD if present
-                if git ls-tree -r --name-only HEAD | grep -q "^${p%/}/\|^${p%/}$"; then
-                  git rm -rf -- "${p%/}" || true
-                fi
-              fi
-            done
           }
 
           REBASE_OK=false
@@ -111,12 +103,8 @@ jobs:
               if "$ONLY_OWNED"; then
                 echo "Conflicts only in owned paths; keeping downstream versions…"
                 for f in "${CONFLICTS[@]}"; do
-                  if git cat-file -e "origin/${DOWNSTREAM_BRANCH}:${f}" 2>/dev/null; then
-                    git checkout "origin/${DOWNSTREAM_BRANCH}" -- "$f" || true
-                    git add -- "$f"
-                  else
-                    git rm -f -- "$f" || true
-                  fi
+                  git checkout --ours -- "$f" || true
+                  git add -- "$f" || true
                 done
                 if git -c core.editor=true rebase --continue; then
                   REBASE_OK=true
@@ -127,12 +115,27 @@ jobs:
                 printf '  - %s\n' "${CONFLICTS[@]}"
                 echo "Aborting rebase and switching to conflict-PR mode…"
                 git rebase --abort
+
+                # Base conflict PR branch on upstream
                 git checkout -B "${HEAD_BRANCH}" "upstream/${UPSTREAM_BRANCH}"
 
-                # Keep owned paths from downstream even in conflict PR head
-                repin_owned_paths
+                # HARD-CLOBBER owned paths to match downstream exactly:
+                # remove current tree, then restore from origin/${DOWNSTREAM_BRANCH}
+                if git ls-tree -r --name-only HEAD -- .github 2>/dev/null | grep -q .; then
+                  git rm -r --cached --quiet --force .github || true
+                  git rm -r --quiet --force .github || true
+                fi
+                git checkout "origin/${DOWNSTREAM_BRANCH}" -- .github || true
+                # CHANGELOG & OWNERS too
+                for p in CHANGELOG OWNERS; do
+                  if git cat-file -e "origin/${DOWNSTREAM_BRANCH}:$p" 2>/dev/null; then
+                    git checkout "origin/${DOWNSTREAM_BRANCH}" -- "$p" || true
+                  else
+                    git rm -f -- "$p" || true
+                  fi
+                done
 
-                if ! git diff --quiet; then
+                if ! git diff --quiet -- .github CHANGELOG OWNERS; then
                   git add -A
                   git -c commit.gpgsign=false commit -m "Preserve downstream-owned files on conflict PR"
                 fi
@@ -142,20 +145,37 @@ jobs:
             done
           fi
 
-          # Re-pin owned paths after a successful rebase, and AMEND instead of creating a new commit.
+          # After a successful rebase, ensure owned paths are identical to downstream.
           if [ "$REBASE_OK" = true ]; then
-            # Only act if owned paths differ from downstream (compare HEAD vs downstream ref)
-            if ! git diff --quiet "origin/${DOWNSTREAM_BRANCH}" "HEAD" -- .github CHANGELOG OWNERS; then
-              repin_owned_paths
-              if ! git diff --quiet -- .github CHANGELOG OWNERS; then
-                git add -A
-                # Number of commits on top of upstream (downstream commits)
-                DOWNSTREAM_ON_TOP=$(git rev-list --count "upstream/${UPSTREAM_BRANCH}..HEAD" || echo 0)
-                if [ "$DOWNSTREAM_ON_TOP" -ge 1 ]; then
-                  git -c commit.gpgsign=false commit --amend --no-edit
+            CHANGED=false
+            # Replace tree completely for .github to prevent any upstream leak.
+            if ! git diff --quiet "origin/${DOWNSTREAM_BRANCH}" "HEAD" -- .github; then
+              if git ls-tree -r --name-only HEAD -- .github 2>/dev/null | grep -q .; then
+                git rm -r --cached --quiet --force .github || true
+                git rm -r --quiet --force .github || true
+              fi
+              git checkout "origin/${DOWNSTREAM_BRANCH}" -- .github || true
+              CHANGED=true
+            fi
+            for p in CHANGELOG OWNERS; do
+              if ! git diff --quiet "origin/${DOWNSTREAM_BRANCH}" "HEAD" -- "$p" 2>/dev/null; then
+                if git cat-file -e "origin/${DOWNSTREAM_BRANCH}:$p" 2>/dev/null; then
+                  git checkout "origin/${DOWNSTREAM_BRANCH}" -- "$p" || true
                 else
-                  git -c commit.gpgsign=false commit -m "Preserve downstream-owned files after rebase"
+                  git rm -f -- "$p" || true
                 fi
+                CHANGED=true
+              fi
+            done
+
+            if [ "$CHANGED" = true ]; then
+              git add -A
+              # Amend into tip if there is at least one downstream commit atop upstream.
+              DOWNSTREAM_ON_TOP=$(git rev-list --count "upstream/${UPSTREAM_BRANCH}..HEAD" || echo 0)
+              if [ "$DOWNSTREAM_ON_TOP" -ge 1 ]; then
+                git -c commit.gpgsign=false commit --amend --no-edit
+              else
+                git -c commit.gpgsign=false commit -m "Preserve downstream-owned files after rebase"
               fi
             fi
           fi
@@ -165,7 +185,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Compare like a PR (merge-base) but ignore owned paths to avoid PRs that are only .github/CHANGELOG/OWNERS
+          # Ignore owned paths so they never cause a PR by themselves.
           if git diff --quiet "origin/${DOWNSTREAM_BRANCH}...${HEAD_BRANCH}" -- . \
             ':(exclude).github' \
             ':(exclude)CHANGELOG' \
@@ -181,7 +201,7 @@ jobs:
         if: steps.diffcheck.outputs.has_changes == 'true'
         run: |
           set -euo pipefail
-          # Push only the feature branch; never force-update the base.
+          # Push only the feature branch. Base branch is never force-updated.
           git push origin "${HEAD_BRANCH}" --force-with-lease
 
       - name: Create or update PR (only if changed)
@@ -191,7 +211,7 @@ jobs:
         run: |
           set -euo pipefail
           TITLE="fix: Sync upstream/${UPSTREAM_BRANCH} into ${DOWNSTREAM_BRANCH}"
-          BODY=$'Automated upstream sync rebased onto upstream; downstream-owned files preserved.\n\n- Source: upstream/'"${UPSTREAM_BRANCH}"$'\n- Base: '"${DOWNSTREAM_BRANCH}"$'\n\nOwned paths (.github, CHANGELOG, OWNERS) are pinned to downstream and ignored for PR creation.'
+          BODY=$'Automated upstream sync; downstream-owned files preserved and ignored for PR creation.\n\n- Source: upstream/'"${UPSTREAM_BRANCH}"$'\n- Base: '"${DOWNSTREAM_BRANCH}"$'\n- Owned: .github/**, CHANGELOG, OWNERS'
           PR_NUMBER=$(gh pr list \
             --repo "${GITHUB_REPOSITORY}" \
             --head "${HEAD_BRANCH}" \

@@ -160,7 +160,7 @@ jobs:
         id: diffcheck
         run: |
           set -euo pipefail
-          # Use merge-base compare (same view as a PR). If nothing changed, skip push/PR.
+          # Use merge-base compare (same view as a PR). If nothing changed, skip push/PR. NEW CHANGE
           if git diff --quiet "origin/${DOWNSTREAM_BRANCH}...${HEAD_BRANCH}"; then
             echo "has_changes=false" >> $GITHUB_OUTPUT
             echo "No actual diff vs downstream; skipping push/PR."

@@ -75,6 +75,22 @@ jobs:
             return 1
           }
 
+          repin_owned_paths() {
+            # Force owned paths to exactly match downstream
+            for p in ".github" "CHANGELOG" "OWNERS"; do
+              if git cat-file -e "origin/${DOWNSTREAM_BRANCH}:${p}" 2>/dev/null; then
+                git checkout "origin/${DOWNSTREAM_BRANCH}" -- "${p%/}" || true
+              elif git ls-tree -r --name-only "origin/${DOWNSTREAM_BRANCH}" | grep -q "^${p%/}/"; then
+                git checkout "origin/${DOWNSTREAM_BRANCH}" -- "${p%/}" || true
+              else
+                # Path absent in downstream -> remove from HEAD if present
+                if git ls-tree -r --name-only HEAD | grep -q "^${p%/}/\|^${p%/}$"; then
+                  git rm -rf -- "${p%/}" || true
+                fi
+              fi
+            done
+          }
+
           REBASE_OK=false
           if git rebase "upstream/${UPSTREAM_BRANCH}"; then
             REBASE_OK=true
@@ -112,14 +128,10 @@ jobs:
                 echo "Aborting rebase and switching to conflict-PR mode…"
                 git rebase --abort
                 git checkout -B "${HEAD_BRANCH}" "upstream/${UPSTREAM_BRANCH}"
+
                 # Keep owned paths from downstream even in conflict PR head
-                for p in ".github" "CHANGELOG" "OWNERS"; do
-                  if git cat-file -e "origin/${DOWNSTREAM_BRANCH}:${p}" 2>/dev/null; then
-                    git checkout "origin/${DOWNSTREAM_BRANCH}" -- "$p" || true
-                  elif git ls-tree -r --name-only "origin/${DOWNSTREAM_BRANCH}" | grep -q "^${p%/}/"; then
-                    git checkout "origin/${DOWNSTREAM_BRANCH}" -- "${p%/}" || true
-                  fi
-                done
+                repin_owned_paths
+
                 if ! git diff --quiet; then
                   git add -A
                   git -c commit.gpgsign=false commit -m "Preserve downstream-owned files on conflict PR"
@@ -130,27 +142,18 @@ jobs:
             done
           fi
 
-          # Re-pin owned paths after a successful rebase, but AMEND instead of creating a new commit
+          # Re-pin owned paths after a successful rebase, and AMEND instead of creating a new commit.
           if [ "$REBASE_OK" = true ]; then
-            # Only touch owned paths if they differ to avoid false positives
-            if ! git diff --quiet -- .github CHANGELOG OWNERS; then
-              for p in ".github" "CHANGELOG" "OWNERS"; do
-                if git cat-file -e "origin/${DOWNSTREAM_BRANCH}:${p}" 2>/dev/null; then
-                  git checkout "origin/${DOWNSTREAM_BRANCH}" -- "$p" || true
-                elif git ls-tree -r --name-only "origin/${DOWNSTREAM_BRANCH}" | grep -q "^${p%/}/"; then
-                  git checkout "origin/${DOWNSTREAM_BRANCH}" -- "${p%/}" || true
-                fi
-              done
-
-              if ! git diff --quiet; then
+            # Only act if owned paths differ from downstream (compare HEAD vs downstream ref)
+            if ! git diff --quiet "origin/${DOWNSTREAM_BRANCH}" "HEAD" -- .github CHANGELOG OWNERS; then
+              repin_owned_paths
+              if ! git diff --quiet -- .github CHANGELOG OWNERS; then
                 git add -A
                 # Number of commits on top of upstream (downstream commits)
                 DOWNSTREAM_ON_TOP=$(git rev-list --count "upstream/${UPSTREAM_BRANCH}..HEAD" || echo 0)
                 if [ "$DOWNSTREAM_ON_TOP" -ge 1 ]; then
-                  # Fold (amend) the re-pin into the tip commit to avoid an extra commit
                   git -c commit.gpgsign=false commit --amend --no-edit
                 else
-                  # Rare: no downstream commits; create a single preservation commit
                   git -c commit.gpgsign=false commit -m "Preserve downstream-owned files after rebase"
                 fi
               fi
@@ -162,7 +165,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Compare as PR would (merge-base), but ignore owned paths to avoid PRs for those only.
+          # Compare like a PR (merge-base) but ignore owned paths to avoid PRs that are only .github/CHANGELOG/OWNERS
           if git diff --quiet "origin/${DOWNSTREAM_BRANCH}...${HEAD_BRANCH}" -- . \
             ':(exclude).github' \
             ':(exclude)CHANGELOG' \
@@ -178,7 +181,7 @@ jobs:
         if: steps.diffcheck.outputs.has_changes == 'true'
         run: |
           set -euo pipefail
-          # Push only the HEAD_BRANCH (feature branch). No force-push to base branch.
+          # Push only the feature branch; never force-update the base.
           git push origin "${HEAD_BRANCH}" --force-with-lease
 
       - name: Create or update PR (only if changed)
@@ -188,7 +191,7 @@ jobs:
         run: |
           set -euo pipefail
           TITLE="fix: Sync upstream/${UPSTREAM_BRANCH} into ${DOWNSTREAM_BRANCH}"
-          BODY=$'Automated upstream sync rebased onto upstream; downstream-owned files preserved.\n\n- Source: upstream/'"${UPSTREAM_BRANCH}"$'\n- Base: '"${DOWNSTREAM_BRANCH}"$'\n\nNote: Owned paths (.github, CHANGELOG, OWNERS) are ignored when deciding to open this PR.'
+          BODY=$'Automated upstream sync rebased onto upstream; downstream-owned files preserved.\n\n- Source: upstream/'"${UPSTREAM_BRANCH}"$'\n- Base: '"${DOWNSTREAM_BRANCH}"$'\n\nOwned paths (.github, CHANGELOG, OWNERS) are pinned to downstream and ignored for PR creation.'
           PR_NUMBER=$(gh pr list \
             --repo "${GITHUB_REPOSITORY}" \
             --head "${HEAD_BRANCH}" \

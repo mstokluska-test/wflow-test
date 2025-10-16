@@ -121,17 +121,40 @@ jobs:
               git commit -m "Merge upstream/${UPSTREAM_BRANCH} (excluded path conflicts kept from midstream)"
               echo "has_conflict=false" >> "$GITHUB_OUTPUT"
             else
-              echo "ERROR: Real conflicts detected - manual resolution required"
-              git merge --abort
-              echo "has_conflict=true" >> "$GITHUB_OUTPUT"
+              echo "Real conflicts detected in non-excluded files"
+              echo "Conflicts:"
+              for file in "${CONFLICTS[@]}"; do
+                echo "  - $file"
+              done
+              echo ""
+              echo "Creating conflict PR for manual resolution..."
               
-              # For conflict PR: just add a marker file, don't touch anything else
-              echo "# Merge Conflict" > CONFLICT_NOTICE.md
-              echo "" >> CONFLICT_NOTICE.md
-              echo "Upstream has changes that conflict with midstream." >> CONFLICT_NOTICE.md
-              echo "Manual merge required." >> CONFLICT_NOTICE.md
-              git add CONFLICT_NOTICE.md
-              git commit -m "chore: conflict marker - manual merge required"
+              # Resolve excluded path conflicts automatically (keep ours)
+              for file in "${CONFLICTS[@]}"; do
+                if is_excluded "$file"; then
+                  echo "Auto-resolving excluded file: $file (keeping midstream)"
+                  git checkout --ours "$file" || true
+                  git add "$file" || true
+                fi
+              done
+              
+              # Check if there are still unresolved conflicts
+              UNRESOLVED=$(git diff --name-only --diff-filter=U || echo "")
+              if [ -n "$UNRESOLVED" ]; then
+                echo "Unresolved conflicts remain in:"
+                echo "$UNRESOLVED" | while read -r file; do
+                  echo "  - $file"
+                  # Add files with conflict markers
+                  git add "$file" || true
+                done
+                # Commit with conflict markers in place
+                git commit -m "Merge upstream/${UPSTREAM_BRANCH} (HAS CONFLICTS - manual resolution needed)"
+                echo "has_conflict=true" >> "$GITHUB_OUTPUT"
+              else
+                # All conflicts were in excluded paths, resolved
+                git commit -m "Merge upstream/${UPSTREAM_BRANCH} (excluded path conflicts auto-resolved)"
+                echo "has_conflict=false" >> "$GITHUB_OUTPUT"
+              fi
             fi
           fi
 
@@ -141,6 +164,7 @@ jobs:
           # If there's a conflict, always create PR
           if [ "${{ steps.merge_step.outputs.has_conflict }}" = "true" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "PR needed for conflict resolution"
             exit 0
           fi
           
@@ -165,8 +189,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ steps.merge_step.outputs.has_conflict }}" = "true" ]; then
-            TITLE="sync: Manual merge required (${UPSTREAM_BRANCH} → ${DOWNSTREAM_BRANCH})"
-            BODY="Upstream changes conflict with midstream. Manual merge required. Excluded paths (.github, CHANGELOG, OWNERS) are always kept from midstream."
+            TITLE="⚠️ sync: Merge upstream/${UPSTREAM_BRANCH} (HAS CONFLICTS)"
+            BODY="Upstream merge has conflicts that need manual resolution. Excluded path conflicts (.github, CHANGELOG, OWNERS) have been auto-resolved to midstream version. Please resolve remaining conflicts in the Files Changed tab or locally."
           else
             TITLE="sync: Merge upstream/${UPSTREAM_BRANCH} into ${DOWNSTREAM_BRANCH}"
             BODY="Successfully merged upstream changes. Excluded paths (.github, CHANGELOG, OWNERS) preserved from midstream."

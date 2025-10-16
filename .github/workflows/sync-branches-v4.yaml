@@ -144,9 +144,18 @@ jobs:
                 PICKED_COUNT=$((PICKED_COUNT + 1))
               else
                 echo "  → ERROR: Conflict in non-excluded file"
+                echo "Conflicts:"
+                for cfile in "${CONFLICTS[@]}"; do
+                  echo "    - $cfile"
+                done
+                echo ""
+                echo "Manual resolution required. Please:"
+                echo "  1. git checkout main"
+                echo "  2. git merge upstream/${UPSTREAM_BRANCH}"
+                echo "  3. Resolve conflicts"
+                echo "  4. git commit && git push"
                 git cherry-pick --abort
-                CONFLICT=true
-                break
+                exit 1
               fi
             else
               echo "  → Cherry-picked successfully"
@@ -170,25 +179,6 @@ jobs:
           
           echo ""
           echo "Summary: Picked $PICKED_COUNT commits, skipped $SKIPPED_COUNT commits"
-          
-          if [ "$CONFLICT" = true ]; then
-            echo "has_conflict=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_conflict=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Handle conflicts
-        if: steps.sync.outputs.has_conflict == 'true'
-        run: |
-          echo "# Manual Merge Required" > CONFLICT_NOTICE.md
-          echo "" >> CONFLICT_NOTICE.md
-          echo "Upstream has changes that conflict with midstream outside of excluded paths." >> CONFLICT_NOTICE.md
-          echo "Manual resolution required." >> CONFLICT_NOTICE.md
-          echo "" >> CONFLICT_NOTICE.md
-          echo "**Excluded paths** (\`.github\`, \`CHANGELOG\`, \`OWNERS\`) are always kept from midstream." >> CONFLICT_NOTICE.md
-          
-          git add CONFLICT_NOTICE.md
-          git commit -m "chore: conflict marker - manual merge required"
 
       - name: Check for actual changes
         id: diffcheck
@@ -212,13 +202,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "${{ steps.sync.outputs.has_conflict }}" = "true" ]; then
-            TITLE="sync: Manual merge required (${UPSTREAM_BRANCH} → ${DOWNSTREAM_BRANCH})"
-            BODY="Upstream changes conflict with midstream. Manual merge required. Note: Commits that only modify excluded paths (.github, CHANGELOG, OWNERS) are skipped."
-          else
-            TITLE="sync: Merge upstream/${UPSTREAM_BRANCH} into ${DOWNSTREAM_BRANCH}"
-            BODY="Successfully synced upstream changes. Excluded paths (.github, CHANGELOG, OWNERS) are preserved from midstream. Upstream commits that only modify excluded paths are skipped. You may be behind upstream for excluded-path-only commits (this is expected)."
-          fi
+          TITLE="sync: Merge upstream/${UPSTREAM_BRANCH} into ${DOWNSTREAM_BRANCH}"
+          BODY="Successfully synced upstream changes. Excluded paths (.github, CHANGELOG, OWNERS) are preserved from midstream. Upstream commits that only modify excluded paths are skipped. You may be behind upstream for excluded-path-only commits (this is expected)."
           
           PR_NUMBER=$(gh pr list \
             --repo "${GITHUB_REPOSITORY}" \

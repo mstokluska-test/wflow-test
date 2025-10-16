@@ -1,0 +1,254 @@
+name: Sync Upstream (v4 - Clean PR)
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      downstream_branch:
+        description: Downstream branch to update (destination)
+        required: false
+        default: main
+      upstream_branch:
+        description: Upstream branch to sync from (source)
+        required: false
+        default: main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      DOWNSTREAM_BRANCH: ${{ inputs.downstream_branch || 'main' }}
+      UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'main' }}
+      HEAD_BRANCH: sync/upstream-${{ inputs.upstream_branch || 'main' }}
+      LABEL: automated-merge-sync
+
+    steps:
+      - name: Checkout downstream repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DOWNSTREAM_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.REPO_WORKFLOW_PAT }}
+
+      - name: Set up Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/mstokluska-test/wflow-test || git remote set-url upstream https://github.com/mstokluska-test/wflow-test
+          git fetch upstream "${UPSTREAM_BRANCH}"
+          git fetch origin "${DOWNSTREAM_BRANCH}"
+
+      - name: Create sync branch from downstream
+        run: |
+          # Start from downstream - midstream commits already on top
+          git checkout -B "${HEAD_BRANCH}" "origin/${DOWNSTREAM_BRANCH}"
+
+      - name: Cherry-pick upstream commits (skip excluded-only commits)
+        id: sync
+        run: |
+          set -euo pipefail
+          
+          EXCLUDED_PATHS=(".github" "CHANGELOG" "OWNERS")
+          
+          # Check if path is excluded
+          is_excluded() {
+            local file="$1"
+            for excluded in "${EXCLUDED_PATHS[@]}"; do
+              if [[ "$file" == "$excluded"/* ]] || [[ "$file" == "$excluded" ]]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+          
+          # Find commits in upstream that aren't in downstream
+          UPSTREAM_COMMITS=$(git rev-list --reverse "origin/${DOWNSTREAM_BRANCH}..upstream/${UPSTREAM_BRANCH}" || echo "")
+          
+          if [ -z "$UPSTREAM_COMMITS" ]; then
+            echo "No new upstream commits to sync"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          echo "Found $(echo "$UPSTREAM_COMMITS" | wc -l) upstream commits to process..."
+          CONFLICT=false
+          PICKED_COUNT=0
+          SKIPPED_COUNT=0
+          
+          for commit in $UPSTREAM_COMMITS; do
+            echo "Processing: $(git log -1 --oneline $commit)"
+            
+            # Skip merge commits
+            if [ $(git cat-file -p "$commit" | grep -c "^parent") -gt 1 ]; then
+              echo "  → Skipping merge commit"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
+            
+            # Check if commit only touches excluded paths
+            COMMIT_FILES=$(git diff-tree --no-commit-id --name-only -r "$commit" || echo "")
+            if [ -n "$COMMIT_FILES" ]; then
+              ALL_EXCLUDED=true
+              while IFS= read -r file; do
+                if ! is_excluded "$file"; then
+                  ALL_EXCLUDED=false
+                  break
+                fi
+              done <<< "$COMMIT_FILES"
+              
+              if [ "$ALL_EXCLUDED" = true ]; then
+                echo "  → Skipping (only touches excluded paths)"
+                SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+                continue
+              fi
+            fi
+            
+            # Try to cherry-pick this commit
+            if ! git cherry-pick "$commit"; then
+              # Cherry-pick failed - check conflicts
+              mapfile -t CONFLICTS < <(git diff --name-only --diff-filter=U || true)
+              
+              if [ ${#CONFLICTS[@]} -eq 0 ]; then
+                echo "  → ERROR: Cherry-pick failed but no conflicts"
+                git cherry-pick --abort 2>/dev/null || true
+                CONFLICT=true
+                break
+              fi
+              
+              # Check if all conflicts are in excluded paths
+              ONLY_EXCLUDED=true
+              for file in "${CONFLICTS[@]}"; do
+                if ! is_excluded "$file"; then
+                  ONLY_EXCLUDED=false
+                  echo "  → Real conflict in: $file"
+                  break
+                fi
+              done
+              
+              if [ "$ONLY_EXCLUDED" = true ]; then
+                echo "  → Resolving excluded path conflicts (keeping downstream)"
+                for file in "${CONFLICTS[@]}"; do
+                  git checkout --ours "$file" || true
+                  git add "$file" || true
+                done
+                git -c core.editor=true cherry-pick --continue
+                PICKED_COUNT=$((PICKED_COUNT + 1))
+              else
+                echo "  → ERROR: Conflict in non-excluded file"
+                git cherry-pick --abort
+                CONFLICT=true
+                break
+              fi
+            else
+              echo "  → Cherry-picked successfully"
+              PICKED_COUNT=$((PICKED_COUNT + 1))
+            fi
+            
+            # After cherry-pick, restore excluded paths from downstream
+            for path in "${EXCLUDED_PATHS[@]}"; do
+              if git cat-file -e "origin/${DOWNSTREAM_BRANCH}:${path}" 2>/dev/null; then
+                git rm -rf "${path}" 2>/dev/null || true
+                git checkout "origin/${DOWNSTREAM_BRANCH}" -- "${path}" 2>/dev/null || true
+              fi
+            done
+            
+            # Amend the commit if we changed excluded paths (check both staged and working tree)
+            if ! git diff --cached --quiet || ! git diff --quiet; then
+              git add -A
+              git commit --amend --no-edit || echo "Warning: Could not amend commit"
+            fi
+          done
+          
+          echo ""
+          echo "Summary: Picked $PICKED_COUNT commits, skipped $SKIPPED_COUNT commits"
+          
+          if [ "$CONFLICT" = true ]; then
+            echo "has_conflict=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_conflict=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Handle conflicts
+        if: steps.sync.outputs.has_conflict == 'true'
+        run: |
+          echo "# Manual Merge Required" > CONFLICT_NOTICE.md
+          echo "" >> CONFLICT_NOTICE.md
+          echo "Upstream has changes that conflict with midstream outside of excluded paths." >> CONFLICT_NOTICE.md
+          echo "Manual resolution required." >> CONFLICT_NOTICE.md
+          echo "" >> CONFLICT_NOTICE.md
+          echo "**Excluded paths** (\`.github\`, \`CHANGELOG\`, \`OWNERS\`) are always kept from midstream." >> CONFLICT_NOTICE.md
+          
+          git add CONFLICT_NOTICE.md
+          git commit -m "chore: conflict marker - manual merge required"
+
+      - name: Check for actual changes
+        id: diffcheck
+        run: |
+          # Compare with downstream
+          if git diff --quiet "origin/${DOWNSTREAM_BRANCH}...${HEAD_BRANCH}"; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No changes detected"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "Changes detected"
+          fi
+
+      - name: Push sync branch
+        if: steps.diffcheck.outputs.has_changes == 'true'
+        run: |
+          git push origin "${HEAD_BRANCH}" --force-with-lease
+
+      - name: Create or update PR
+        if: steps.diffcheck.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.sync.outputs.has_conflict }}" = "true" ]; then
+            TITLE="sync: Manual merge required (${UPSTREAM_BRANCH} → ${DOWNSTREAM_BRANCH})"
+            BODY="Upstream changes conflict with midstream. Manual merge required. Note: Commits that only modify excluded paths (.github, CHANGELOG, OWNERS) are skipped."
+          else
+            TITLE="sync: Merge upstream/${UPSTREAM_BRANCH} into ${DOWNSTREAM_BRANCH}"
+            BODY="Successfully synced upstream changes. Excluded paths (.github, CHANGELOG, OWNERS) are preserved from midstream. Upstream commits that only modify excluded paths are skipped. You may be behind upstream for excluded-path-only commits (this is expected)."
+          fi
+          
+          PR_NUMBER=$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --head "${HEAD_BRANCH}" \
+            --base "${DOWNSTREAM_BRANCH}" \
+            --state open \
+            --label "${LABEL}" \
+            --json number \
+            --jq '.[0].number // empty')
+          
+          if [ -n "$PR_NUMBER" ]; then
+            echo "Updating PR #${PR_NUMBER}"
+            gh pr edit "$PR_NUMBER" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "$TITLE" \
+              --body "$BODY"
+          else
+            echo "Creating PR"
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base "${DOWNSTREAM_BRANCH}" \
+              --head "${HEAD_BRANCH}" \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --label "${LABEL}" || \
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base "${DOWNSTREAM_BRANCH}" \
+              --head "${HEAD_BRANCH}" \
+              --title "$TITLE" \
+              --body "$BODY"
+          fi
+

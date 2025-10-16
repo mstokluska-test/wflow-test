@@ -1,4 +1,4 @@
-name: Sync Upstream test
+name: Sync Upstream test upstream change
 
 on:
   schedule:
